@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -49,13 +51,52 @@ func (s *serviceList) String() string {
 	return strings.Join(parts, ",")
 }
 
+// Set adds Services. A Service named twice is kept once: a duplicate would
+// be probed twice per node and halve the effective --fall.
 func (s *serviceList) Set(v string) error {
 	for item := range strings.SplitSeq(v, ",") {
 		ns, name, ok := strings.Cut(strings.TrimSpace(item), "/")
 		if !ok || ns == "" || name == "" {
 			return fmt.Errorf("want namespace/name, got %q", item)
 		}
-		*s = append(*s, types.NamespacedName{Namespace: ns, Name: name})
+		n := types.NamespacedName{Namespace: ns, Name: name}
+		if !slices.Contains(*s, n) {
+			*s = append(*s, n)
+		}
+	}
+	return nil
+}
+
+// validate checks the settings that flag parsing cannot.
+func validate(cfg controller.Config, probeTimeout time.Duration, rise, fall int) error {
+	if net.ParseIP(cfg.FloatingIP).To4() == nil {
+		return errors.New("--floating-ip must be an IPv4 address")
+	}
+	if len(cfg.Services) == 0 {
+		return errors.New("at least one --service is required")
+	}
+	if rise < 1 || fall < 1 {
+		return errors.New("--rise and --fall must be at least 1")
+	}
+	for _, d := range []struct {
+		flag string
+		v    time.Duration
+	}{
+		{"--interval", cfg.Interval},
+		{"--vip-refresh", cfg.VIPRefresh},
+		{"--max-backoff", cfg.MaxBackoff},
+		{"--verify-timeout", cfg.VerifyTimeout},
+		{"--quarantine", cfg.Quarantine},
+		{"--probe-timeout", probeTimeout},
+	} {
+		if d.v <= 0 {
+			return fmt.Errorf("%s must be positive, got %s", d.flag, d.v)
+		}
+	}
+	switch cfg.AddressType {
+	case corev1.NodeHostName, corev1.NodeInternalIP, corev1.NodeExternalIP, corev1.NodeInternalDNS, corev1.NodeExternalDNS:
+	default:
+		return fmt.Errorf("--node-address-type must be one of Hostname, InternalIP, ExternalIP, InternalDNS, ExternalDNS; got %q", cfg.AddressType)
 	}
 	return nil
 }
@@ -89,6 +130,7 @@ func run() error {
 	flag.DurationVar(&cfg.VIPRefresh, "vip-refresh", 30*time.Second, "how often to re-read the floating IP holder from the API")
 	flag.DurationVar(&cfg.MaxBackoff, "max-backoff", time.Minute, "maximum delay between failed reassignments")
 	flag.DurationVar(&cfg.VerifyTimeout, "verify-timeout", 15*time.Second, "how long to wait for the API to report a new holder")
+	flag.DurationVar(&cfg.Quarantine, "quarantine", 5*time.Minute, fmt.Sprintf("how long an instance is skipped as a target after %d failed moves to it", controller.QuarantineAfter))
 	flag.BoolVar(&cfg.DryRun, "dry-run", false, "decide and report, but never call the API to reassign")
 	flag.DurationVar(&probeTimeout, "probe-timeout", time.Second, "timeout of one health check probe")
 	flag.IntVar(&rise, "rise", 2, "consecutive successful probes before a node becomes eligible")
@@ -110,14 +152,11 @@ func run() error {
 
 	cfg.Services = services
 	cfg.AddressType = corev1.NodeAddressType(addressType)
-	if net.ParseIP(cfg.FloatingIP).To4() == nil {
-		return errors.New("--floating-ip must be an IPv4 address")
+	if err := validate(cfg, probeTimeout, rise, fall); err != nil {
+		return err
 	}
-	if len(cfg.Services) == 0 {
-		return errors.New("at least one --service is required")
-	}
-	if rise < 1 || fall < 1 {
-		return errors.New("--rise and --fall must be at least 1")
+	if leaderElect && leaseNamespace == "" {
+		return errors.New("--lease-namespace or POD_NAMESPACE is required with --leader-elect")
 	}
 	creds, err := credentialsFromEnv()
 	if err != nil {
@@ -134,14 +173,17 @@ func run() error {
 		return err
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	// sigCtx ends on a signal or a failed HTTP server. The controller and
+	// the leader election have their own contexts so that shutdown can run
+	// in order: stop the loop, wait for it, then release the lease.
+	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	metrics := controller.NewMetrics(reg)
 
-	broadcaster := record.NewBroadcaster(record.WithContext(ctx))
+	broadcaster := record.NewBroadcaster(record.WithContext(context.Background()))
 	broadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: cs.CoreV1().Events("")})
 	defer broadcaster.Shutdown()
 	recorder := broadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "contabo-fip-controller"})
@@ -152,32 +194,49 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	// Followers keep warm caches so a takeover starts deciding at once.
-	factory.Start(ctx.Done())
-	defer factory.Shutdown()
-	for typ, ok := range factory.WaitForCacheSync(ctx.Done()) {
-		if !ok {
-			return fmt.Errorf("informer cache for %v did not sync", typ)
-		}
-	}
 
-	srv := &http.Server{Addr: metricsAddr, Handler: httpMux(reg), ReadHeaderTimeout: 5 * time.Second}
+	// Serve /metrics and /healthz before the caches sync, and fail the
+	// process when the server cannot run.
+	ln, err := net.Listen("tcp", metricsAddr)
+	if err != nil {
+		return fmt.Errorf("metrics server: %w", err)
+	}
+	srv := &http.Server{Handler: httpMux(reg, ctrl.Healthy), ReadHeaderTimeout: 5 * time.Second}
+	serveErr := make(chan error, 1)
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Error("metrics server", "err", err)
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- fmt.Errorf("metrics server: %w", err)
 			stop()
 		}
 	}()
 	defer srv.Shutdown(context.Background())
+	result := func(err error) error {
+		select {
+		case serr := <-serveErr:
+			return errors.Join(serr, err)
+		default:
+			return err
+		}
+	}
+
+	// Followers keep warm caches so a takeover starts deciding at once.
+	factory.Start(sigCtx.Done())
+	defer factory.Shutdown()
+	for typ, ok := range factory.WaitForCacheSync(sigCtx.Done()) {
+		if !ok {
+			if sigCtx.Err() != nil {
+				return result(nil) // shut down before the caches synced
+			}
+			return result(fmt.Errorf("informer cache for %v did not sync", typ))
+		}
+	}
 
 	log.Info("starting", "version", version, "floatingIP", cfg.FloatingIP, "services", services.String(), "dryRun", cfg.DryRun)
+	gate := newRunGate()
 	if !leaderElect {
 		metrics.Leader.Set(1)
-		ctrl.Run(ctx)
-		return nil
-	}
-	if leaseNamespace == "" {
-		return errors.New("--lease-namespace or POD_NAMESPACE is required with --leader-elect")
+		gate.run(sigCtx, ctrl.Run)
+		return result(nil)
 	}
 	identity := os.Getenv("POD_NAME")
 	if identity == "" {
@@ -190,8 +249,15 @@ func run() error {
 		Client:     cs.CoordinationV1(),
 		LockConfig: resourcelock.ResourceLockConfig{Identity: identity},
 	}
+	leCtx, cancelLE := context.WithCancel(context.Background())
+	defer cancelLE()
+	go func() {
+		<-sigCtx.Done()
+		gate.stopAndWait()
+		cancelLE() // only now may ReleaseOnCancel give the lease away
+	}()
 	lost := false
-	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
+	leaderelection.RunOrDie(leCtx, leaderelection.LeaderElectionConfig{
 		Lock:            lock,
 		ReleaseOnCancel: true,
 		LeaseDuration:   15 * time.Second,
@@ -202,11 +268,11 @@ func run() error {
 			OnStartedLeading: func(ctx context.Context) {
 				log.Info("became leader", "identity", identity)
 				metrics.Leader.Set(1)
-				ctrl.Run(ctx)
+				gate.run(ctx, ctrl.Run)
 			},
 			OnStoppedLeading: func() {
 				metrics.Leader.Set(0)
-				lost = ctx.Err() == nil
+				lost = sigCtx.Err() == nil
 			},
 			OnNewLeader: func(id string) {
 				if id != identity {
@@ -215,11 +281,57 @@ func run() error {
 			},
 		},
 	})
+	// Do not exit under a move that is still in flight.
+	gate.stopAndWait()
 	if lost {
 		// Restart with clean loop state rather than resume a stale view.
-		return errors.New("lost leader lease")
+		return result(errors.New("lost leader lease"))
 	}
-	return nil
+	return result(nil)
+}
+
+// runGate runs the controller loop under a context that a shutdown can
+// cancel, and lets the shutdown wait until the loop has returned.
+type runGate struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	mu      sync.Mutex
+	stopped bool
+	wg      sync.WaitGroup
+}
+
+func newRunGate() *runGate {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &runGate{ctx: ctx, cancel: cancel}
+}
+
+// run calls fn with a context that ends with parent or with stopAndWait,
+// unless stopAndWait has already been called.
+func (g *runGate) run(parent context.Context, fn func(context.Context)) {
+	g.mu.Lock()
+	if g.stopped {
+		g.mu.Unlock()
+		return
+	}
+	g.wg.Add(1)
+	g.mu.Unlock()
+	defer g.wg.Done()
+
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	defer context.AfterFunc(g.ctx, cancel)()
+	fn(ctx)
+}
+
+// stopAndWait cancels the running loop, prevents new ones and waits until
+// the running one has returned.
+func (g *runGate) stopAndWait() {
+	g.mu.Lock()
+	g.stopped = true
+	g.mu.Unlock()
+	g.cancel()
+	g.wg.Wait()
 }
 
 func credentialsFromEnv() (contabo.Credentials, error) {
@@ -250,10 +362,16 @@ func kubeConfig(path string) (*rest.Config, error) {
 	return rest.InClusterConfig()
 }
 
-func httpMux(reg *prometheus.Registry) *http.ServeMux {
+// httpMux serves /metrics and /healthz. /healthz answers 500 while healthy
+// returns an error, i.e. on a leader whose loop stopped succeeding.
+func httpMux(reg *prometheus.Registry, healthy func() error) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		if err := healthy(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 		_, _ = w.Write([]byte("ok\n"))
 	})
 	return mux

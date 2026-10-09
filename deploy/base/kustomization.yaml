@@ -5,6 +5,7 @@ resources:
   - namespace.yaml
   - rbac.yaml
   - deployment.yaml
+  - pdb.yaml
 labels:
   - pairs:
       app.kubernetes.io/name: contabo-fip-controller

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -23,6 +24,13 @@ const (
 
 	// tokenSkew renews a token this long before it expires.
 	tokenSkew = 30 * time.Second
+	// minTokenTTL is how long a token is reused at least, whatever
+	// expires_in says, so a missing or tiny value does not cost a grant per
+	// call. A token that really expires earlier is renewed on the 401.
+	minTokenTTL = 60 * time.Second
+	// TokenFailBackoff is how long a failed grant is answered from cache.
+	// Repeated grants with rotated credentials could lock the API user out.
+	TokenFailBackoff = 30 * time.Second
 )
 
 // ErrNotFound is returned when the account has no VIP with the given address.
@@ -46,6 +54,17 @@ type APIError struct {
 
 func (e *APIError) Error() string {
 	return fmt.Sprintf("contabo %s %s: HTTP %d: %s", e.Method, e.Path, e.Status, e.Body)
+}
+
+// TokenError is a refused token grant. It is not an APIError: a refused
+// grant says nothing about the VIP the request was for.
+type TokenError struct {
+	Status int
+	Body   string
+}
+
+func (e *TokenError) Error() string {
+	return fmt.Sprintf("contabo token: HTTP %d: %s", e.Status, e.Body)
 }
 
 // VIP is the subset of a Contabo VIP the controller reads.
@@ -74,10 +93,12 @@ type Client struct {
 	Creds   Credentials
 	HTTP    *http.Client
 
-	mu     sync.Mutex
-	token  string
-	expiry time.Time
-	now    func() time.Time
+	mu       sync.Mutex
+	token    string
+	expiry   time.Time
+	tokenErr error     // last failed grant
+	errUntil time.Time // tokenErr is returned until then
+	now      func() time.Time
 }
 
 // New returns a client for the public Contabo endpoints.
@@ -196,6 +217,23 @@ func (c *Client) accessToken(ctx context.Context) (string, error) {
 	if c.token != "" && c.now().Before(c.expiry) {
 		return c.token, nil
 	}
+	if c.tokenErr != nil && c.now().Before(c.errUntil) {
+		return "", c.tokenErr
+	}
+	token, err := c.grant(ctx)
+	if err != nil {
+		// A cancelled request says nothing about the credentials.
+		if ctx.Err() == nil {
+			c.tokenErr, c.errUntil = err, c.now().Add(TokenFailBackoff)
+		}
+		return "", err
+	}
+	c.tokenErr = nil
+	return token, nil
+}
+
+// grant runs the password grant. The caller holds c.mu.
+func (c *Client) grant(ctx context.Context) (string, error) {
 	form := url.Values{
 		"grant_type":    {"password"},
 		"client_id":     {c.Creds.ClientID},
@@ -219,7 +257,7 @@ func (c *Client) accessToken(ctx context.Context) (string, error) {
 	}
 	if resp.StatusCode != http.StatusOK {
 		// The body of a failed grant names the error, never the credentials.
-		return "", &APIError{Method: http.MethodPost, Path: "token", Status: resp.StatusCode, Body: truncate(string(data), 256)}
+		return "", &TokenError{Status: resp.StatusCode, Body: truncate(string(data), 256)}
 	}
 	var tok struct {
 		AccessToken string `json:"access_token"`
@@ -232,7 +270,7 @@ func (c *Client) accessToken(ctx context.Context) (string, error) {
 		return "", errors.New("contabo token: empty access_token")
 	}
 	c.token = tok.AccessToken
-	c.expiry = c.now().Add(time.Duration(tok.ExpiresIn)*time.Second - tokenSkew)
+	c.expiry = c.now().Add(max(time.Duration(tok.ExpiresIn)*time.Second-tokenSkew, minTokenTTL))
 	return c.token, nil
 }
 
@@ -250,9 +288,13 @@ func uuid4() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
+// truncate cuts s to at most n bytes without splitting a UTF-8 sequence.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n] + "…"
 }

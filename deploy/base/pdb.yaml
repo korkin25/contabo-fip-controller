@@ -1,0 +1,10 @@
+# Keep one replica through voluntary disruptions such as node drains.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: contabo-fip-controller
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: contabo-fip-controller

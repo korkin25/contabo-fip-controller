@@ -10,13 +10,16 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
 type fakeAPI struct {
 	tokens    atomic.Int32
+	grants    atomic.Int32 // token requests, failed ones included
 	reject401 atomic.Int32 // answer this many API calls with 401
+	expiresIn atomic.Value // string; the expires_in JSON value
 	t         *testing.T
 	handler   func(w http.ResponseWriter, r *http.Request)
 }
@@ -33,6 +36,7 @@ func newFake(t *testing.T, handler func(w http.ResponseWriter, r *http.Request))
 
 func (f *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/token" {
+		f.grants.Add(1)
 		if err := r.ParseForm(); err != nil {
 			f.t.Fatal(err)
 		}
@@ -41,7 +45,11 @@ func (f *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		n := f.tokens.Add(1)
-		_, _ = io.WriteString(w, `{"access_token":"tok`+string(rune('0'+n))+`","expires_in":300}`)
+		exp := "300"
+		if v, ok := f.expiresIn.Load().(string); ok {
+			exp = v
+		}
+		_, _ = io.WriteString(w, `{"access_token":"tok`+string(rune('0'+n))+`","expires_in":`+exp+`}`)
 		return
 	}
 	if !uuidRe.MatchString(r.Header.Get("x-request-id")) {
@@ -166,7 +174,99 @@ func TestBadCredentials(t *testing.T) {
 	_, c := newFake(t, func(w http.ResponseWriter, r *http.Request) {})
 	c.Creds.Password = "wrong"
 	c.Creds.Username = "x"
-	if _, err := c.GetVIP(context.Background(), "203.0.113.10"); err == nil {
+	_, err := c.GetVIP(context.Background(), "203.0.113.10")
+	var tokErr *TokenError
+	var apiErr *APIError
+	if !errors.As(err, &tokErr) || tokErr.Status != http.StatusUnauthorized || errors.As(err, &apiErr) {
+		t.Fatalf("want a TokenError that is not an APIError, got %v", err)
+	}
+}
+
+func TestFailedGrantIsCached(t *testing.T) {
+	f, c := newFake(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"data":[{"resourceType":"instances","resourceId":"1"}]}`)
+	})
+	now := time.Unix(1_000_000, 0)
+	c.now = func() time.Time { return now }
+	c.Creds.Username = "rotated"
+	ctx := context.Background()
+	for range 5 {
+		if _, err := c.GetVIP(ctx, "203.0.113.10"); err == nil {
+			t.Fatal("want error")
+		}
+	}
+	if got := f.grants.Load(); got != 1 {
+		t.Fatalf("%d grants within the backoff, want 1", got)
+	}
+	// After the backoff the grant is tried again and new credentials work.
+	now = now.Add(TokenFailBackoff)
+	c.Creds.Username = "u"
+	if _, err := c.GetVIP(ctx, "203.0.113.10"); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.grants.Load(); got != 2 {
+		t.Fatalf("%d grants, want 2", got)
+	}
+}
+
+func TestCancelledGrantIsNotCached(t *testing.T) {
+	f, c := newFake(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"data":[]}`)
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := c.GetVIP(ctx, "203.0.113.10"); err == nil {
 		t.Fatal("want error")
+	}
+	if _, err := c.GetVIP(context.Background(), "203.0.113.10"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("got %v, want ErrNotFound", err)
+	}
+	if got := f.tokens.Load(); got != 1 {
+		t.Fatalf("%d tokens issued, want 1", got)
+	}
+}
+
+func TestTinyExpiresInHasFloor(t *testing.T) {
+	for _, exp := range []string{"0", "5", "null"} {
+		t.Run(exp, func(t *testing.T) {
+			f, c := newFake(t, func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, `{"data":[]}`)
+			})
+			f.expiresIn.Store(exp)
+			now := time.Unix(1_000_000, 0)
+			c.now = func() time.Time { return now }
+			for range 3 {
+				_, _ = c.GetVIP(context.Background(), "203.0.113.10")
+				now = now.Add(10 * time.Second)
+			}
+			if got := f.tokens.Load(); got != 1 {
+				t.Fatalf("%d tokens in 30s, want 1", got)
+			}
+			now = now.Add(minTokenTTL)
+			_, _ = c.GetVIP(context.Background(), "203.0.113.10")
+			if got := f.tokens.Load(); got != 2 {
+				t.Fatalf("%d tokens after the floor, want 2", got)
+			}
+		})
+	}
+}
+
+func TestTruncateKeepsRunes(t *testing.T) {
+	tests := []struct {
+		in   string
+		n    int
+		want string
+	}{
+		{"short", 10, "short"},
+		{"abcdef", 3, "abc…"},
+		{"aжb", 2, "a…"}, // ж is two bytes; cutting at 2 would split it
+		{"жж", 3, "ж…"},
+		{"日本", 2, "…"},
+	}
+	for _, tt := range tests {
+		got := truncate(tt.in, tt.n)
+		if got != tt.want || !utf8.ValidString(got) {
+			t.Errorf("truncate(%q, %d) = %q, want %q", tt.in, tt.n, got, tt.want)
+		}
 	}
 }
