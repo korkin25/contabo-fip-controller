@@ -1,0 +1,77 @@
+# Two replicas on different nodes; only the Lease holder acts. The
+# configuration (floating IP, Services) comes from an overlay patch of args,
+# the credentials from the Secret contabo-fip-controller-credentials.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: contabo-fip-controller
+spec:
+  replicas: 2
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
+  template:
+    spec:
+      serviceAccountName: contabo-fip-controller
+      priorityClassName: system-cluster-critical
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: contabo-fip-controller
+      tolerations:
+        # Control-plane nodes are workers in a small Talos cluster.
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: ghcr.io/korkin25/contabo-fip-controller:latest
+          args:
+            - --floating-ip=$(FLOATING_IP)
+            - --service=$(SERVICES)
+          env:
+            - name: FLOATING_IP
+              value: "203.0.113.10"
+            - name: SERVICES
+              value: envoy-gateway-system/public
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          envFrom:
+            - secretRef:
+                name: contabo-fip-controller-credentials
+          ports:
+            - name: metrics
+              containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
